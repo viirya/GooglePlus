@@ -39,7 +39,11 @@ module Web.GooglePlus (getPerson,
                        getActivity,
                        getLatestActivityFeed,
                        enumActivityFeed,
-                       enumActivities) where
+                       getActivityFeed,
+                       enumActivities,
+                       getActivities,
+                       enumPersonSearch,
+                       getPersonSearch) where
 
 import Web.GooglePlus.Types
 import Web.GooglePlus.Monad
@@ -53,6 +57,7 @@ import           Data.Aeson (json,
                              fromJSON,
                              parseJSON,
                              Result(..),
+                             (.:),
                              (.:?),
                              Value(Object))
 import           Data.Aeson.Types (typeMismatch)
@@ -62,12 +67,11 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import           Data.Enumerator (Enumerator,
-                                  joinI,
                                   checkContinue1,
                                   continue,
                                   Stream (Chunks),
                                   (>>==),
-                                  ($=),
+                                  run_,
                                   ($$))
 import qualified Data.Enumerator.List as EL
 import           Data.Maybe (fromMaybe)
@@ -97,7 +101,7 @@ getLatestActivityFeed :: PersonID              -- ^ Feed owner ID
                          -> Maybe Integer      -- ^ Page size. Should be between 1 and 100. Default 20.
                          -> GooglePlusM (Either Text ActivityFeed)
 getLatestActivityFeed pid coll perPage = do
-  feed <- getActivityFeedPage pid coll (perPage' perPage) Nothing
+  feed <- getActivityFeedPage pid coll (perPageActivity perPage) Nothing
   return $ fst `fmap` feed
 
 -- | Paginating enumerator to consume a user's activity stream. Each chunk will
@@ -113,7 +117,20 @@ enumActivityFeed :: PersonID              -- ^ Feed owner ID
                     -> Maybe Integer      -- ^ Page size. Should be between 1 and 100. Defualt 20
                     -> Enumerator ActivityFeed GooglePlusM b
 enumActivityFeed pid coll perPage = EL.unfoldM depaginate FirstPage
-  where depaginate = depaginateActivityFeed pid coll $ perPage' perPage
+  where depaginate = depaginateActivityFeed pid coll $ perPageActivity perPage
+
+-- | Simplified version of enumActivityFeed which retrieves all pages of an
+-- activity feed and merges them into one. Note that this will not be as
+-- efficient as enumActivityFeed in terms of memory/time because it collects
+-- them all in memory first. Note that this should incur 1 API call per page of
+-- results, so the max page size of 100 is used.
+getActivityFeed :: PersonID
+                   -> ActivityCollection
+                   -> GooglePlusM ActivityFeed
+getActivityFeed pid coll = do
+  feeds <- run_ $ enumActivityFeed pid coll (Just 100) $$ EL.consume
+  return $ foldl1 mergeFeeds feeds
+  where mergeFeeds a ActivityFeed { activityFeedItems = is} = a { activityFeedItems = (activityFeedItems a) ++ is }
 
 -- | Paginating enumerator yielding a Chunk for each page. Use this if you
 -- don't need the feed metadata that enumActivityFeed provides.
@@ -122,15 +139,40 @@ enumActivities :: PersonID              -- ^ Feed owner ID
                   -> Maybe Integer      -- ^ Page size. Should be between 1 and 100. Defualt 20
                   -> Enumerator Activity GooglePlusM b
 enumActivities pid coll perPage = unfoldListM depaginate FirstPage
-  where depaginate = depaginateActivities pid coll (perPage' perPage)
+  where depaginate = depaginateActivities pid coll $ perPageActivity perPage
+
+-- | Simplified version of enumActivities that fetches all the activitys of a
+-- Person first, thus returning them. Note that this should incur 1 API call
+-- per page of results, so the max page size of 100 is used.
+getActivities :: PersonID              -- ^ Feed owner ID
+                 -> ActivityCollection -- ^ Indicates what type of feed to retrieve
+                 -> GooglePlusM [Activity]
+getActivities pid coll = run_ $ enumActivities pid coll (Just 100) $$ EL.consume
+
+
+-- | Paginating enumerator yielding a Chunk for each page. Note that this
+-- Enumerator will abort if it encounters an error from the server, thus
+-- cutting the list short.
+enumPersonSearch :: Text             -- ^ Search string
+                    -> Maybe Integer -- ^ Optional page size. Shold be between 1 and 20. Default 10
+                    -> Enumerator PersonSearchResult GooglePlusM b
+enumPersonSearch search perPage = unfoldListM depaginate FirstPage
+  where depaginate = depaginatePersonSearch search (perPagePersonSearch perPage)
+
+-- | Returns the full result set for a person search given a search string.
+-- This interface is simpler to use but does not have the flexibility/memory
+-- usage benefit of enumPersonSearch.
+getPersonSearch :: Text -- ^ Search string
+                -> GooglePlusM [PersonSearchResult]
+getPersonSearch search = run_ $ enumPersonSearch search (Just 20) $$ EL.consume
 
 ---- Helpers
 
-perPage' :: Maybe Integer -> Integer
-perPage' = fromMaybe defaultPageSize
+perPageActivity :: Maybe Integer -> Integer
+perPageActivity = fromMaybe 20
 
-defaultPageSize :: Integer
-defaultPageSize = 20
+perPagePersonSearch :: Maybe Integer -> Integer
+perPagePersonSearch = fromMaybe 10
 
 type PageToken             = Text
 type PaginatedActivityFeed = (ActivityFeed, Maybe PageToken)
@@ -153,21 +195,20 @@ unfoldListM f = checkContinue1 $ \loop s k -> do
 		Nothing -> continue k
 		Just (as, s') -> k (Chunks as) >>== loop s'
 
-depaginateActivities:: PersonID -> ActivityCollection -> Integer -> DepaginationState -> GooglePlusM (Maybe ([Activity], DepaginationState))
-depaginateActivities pid coll perPage state = (return . (fmap unwrap)) =<< depaginateActivityFeed pid coll perPage state
+-- Activities Specifics
+
+depaginateActivities :: PersonID -> ActivityCollection -> Integer -> DepaginationState -> GooglePlusM (Maybe ([Activity], DepaginationState))
+depaginateActivities pid coll perPage state = (return . fmap unwrap) =<< depaginateActivityFeed pid coll perPage state
   where unwrap (feed, s) = (activityFeedItems feed, s)
 
 depaginateActivityFeed :: PersonID -> ActivityCollection -> Integer -> DepaginationState -> GooglePlusM (Maybe (ActivityFeed, DepaginationState))
 depaginateActivityFeed pid coll perPage FirstPage       = do
  page <- getFirstFeedPage pid coll perPage
- return $ paginatedFeedState `fmap` page
+ return $ paginatedState `fmap` page
 depaginateActivityFeed pid coll perPage (MorePages tok) = do
  page <- getActivityFeedPage pid coll perPage $ Just tok
- return $ paginatedFeedState `fmap` eitherMaybe page
+ return $ paginatedState `fmap` eitherMaybe page
 depaginateActivityFeed _ _ _ NoMorePages                = return Nothing
-
-paginatedFeedState :: PaginatedActivityFeed -> (ActivityFeed, DepaginationState)
-paginatedFeedState (feed, token) = (feed, maybe NoMorePages MorePages token)
 
 getFirstFeedPage :: PersonID -> ActivityCollection -> Integer -> GooglePlusM (Maybe PaginatedActivityFeed)
 getFirstFeedPage pid coll perPage = do
@@ -183,6 +224,51 @@ getActivityFeedPage pid coll perPage tok = genericGet pth params
         params = case tok of
                   Nothing -> [("maxResults", Just pageParam)]
                   Just t  -> [("maxResults", Just pageParam), ("pageToken", Just $ encodeUtf8 t)]
+
+-- PersonSearch specifics
+
+depaginatePersonSearch :: Text -> Integer -> DepaginationState -> GooglePlusM (Maybe ([PersonSearchResult], DepaginationState))
+depaginatePersonSearch search perPage state = depaginatePersonSearchResult search perPage state
+
+type PaginatedPersonSearch = ([PersonSearchResult], Maybe PageToken)
+
+instance FromJSON PaginatedPersonSearch where
+  parseJSON (Object v) = (,) <$> v .: "items"
+                             <*> v .:? "nextPageToken"
+  parseJSON v          = typeMismatch "PaginatedPersonSearch" v
+
+
+--TODO: needs refactor soon
+depaginatePersonSearchResult :: Text -> Integer -> DepaginationState -> GooglePlusM (Maybe ([PersonSearchResult], DepaginationState))
+depaginatePersonSearchResult search perPage FirstPage       = do
+ page <- getFirstPersonSearchPage search perPage
+ return $ paginatedState `fmap` page
+depaginatePersonSearchResult search perPage (MorePages tok) = do
+ page <- getPersonSearchPage search perPage $ Just tok
+ return $ paginatedState `fmap` eitherMaybe page
+depaginatePersonSearchResult _ _ NoMorePages                = return Nothing
+
+paginatedState :: (a, Maybe PageToken) -> (a, DepaginationState)
+paginatedState (results, token) = (results, maybe NoMorePages MorePages token)
+
+-- TODO: refactor
+getFirstPersonSearchPage :: Text -> Integer -> GooglePlusM (Maybe PaginatedPersonSearch)
+getFirstPersonSearchPage search perPage = do
+  page <- getPersonSearchPage search perPage Nothing
+  return $ eitherMaybe page
+
+getPersonSearchPage :: Text -> Integer -> Maybe PageToken -> GooglePlusM (Either Text PaginatedPersonSearch)
+getPersonSearchPage search perPage tok = genericGet pth params
+  where pth  = "/plus/v1/people"
+        pageParam = BS8.pack . show $ perPage
+        params = case tok of
+                  Nothing -> [("maxResults", Just pageParam),
+                              ("query", Just $ encodeUtf8 search)]
+                  Just t  -> [("maxResults", Just pageParam),
+                              ("query", Just $ encodeUtf8 search),
+                              ("pageToken", Just $ encodeUtf8 t)]
+
+-- Internals
 
 eitherMaybe :: Either a b -> Maybe b
 eitherMaybe (Left _)  = Nothing

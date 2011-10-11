@@ -13,6 +13,7 @@
 
 {-# LANGUAGE OverloadedStrings #-}
 module Web.GooglePlus.Types (Person(..),
+                             PersonSearchResult(..),
                              PersonID(..),
                              ActivityCollection(..),
                              ID,
@@ -339,6 +340,20 @@ instance FromJSON Person where
                                 <*> v .:? "hasApp"
   parseJSON v          = typeMismatch "Person" v
 
+-- |A Person search result with limited informaiton. The full person's profile must be retrieved to get the rest
+data PersonSearchResult = PersonSearchResult { personSRId          :: ID,    -- ^ Id of the Person
+                                               personSRDisplayName :: Text,  -- ^ Name of the Person, suitable for display
+                                               personSRImage       :: Image, -- ^ Profile image for the Person
+                                               personSRProfileURL  :: URL    -- ^ URL to the person's profile
+                                             } deriving (Show, Eq)
+
+instance FromJSON PersonSearchResult where
+  parseJSON (Object v) = PersonSearchResult <$> v .:  "id"
+                                            <*> v .:  "displayName"
+                                            <*> v .:  "image"
+                                            <*> v .:  "url"
+  parseJSON v          = typeMismatch "PersonSearchResult" v
+
 instance FromJSON Day where
   parseJSON (String str) = pure . read . unpack $ str
   parseJSON v            = typeMismatch "Day" v
@@ -417,14 +432,14 @@ instance FromJSON EmailType where
   parseJSON v                = typeMismatch "EmailType" v
 
 -- |External URLS that the Person has published
-data PersonURL = PersonURL { personUrlPrimary :: Bool,          -- ^ Whether or not the URL is the Person's primary URl
-                             personUrlType    :: PersonURLType, -- ^ Type of URL
-                             personURLValue   :: URL            -- ^ Actual text URl for the Person
+data PersonURL = PersonURL { personUrlPrimary :: Bool,                -- ^ Whether or not the URL is the Person's primary URl
+                             personUrlType    :: Maybe PersonURLType, -- ^ Type of URL
+                             personURLValue   :: URL                  -- ^ Actual text URl for the Person
                              } deriving (Show, Eq)
 
 instance FromJSON PersonURL where
   parseJSON (Object v) = PersonURL <$> v .:| ("primary", False)
-                                   <*> v .:  "type"
+                                   <*> v .:? "type"
                                    <*> v .:  "value"
   parseJSON v          = typeMismatch "PersonURL" v
 
@@ -492,7 +507,7 @@ data Place = Place { placePrimary :: Bool, -- ^ Whether or not this is/was the P
                    } deriving (Show, Eq)
 
 instance FromJSON Place where
-  parseJSON (Object v) = Place <$> v .: "primary"
+  parseJSON (Object v) = Place <$> v .:| ("primary", False)
                                <*> v .: "value"
   parseJSON v          = typeMismatch "Place" v
 
